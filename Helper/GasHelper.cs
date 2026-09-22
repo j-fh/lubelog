@@ -1,4 +1,4 @@
-﻿using CarCareTracker.Models;
+using CarCareTracker.Models;
 
 namespace CarCareTracker.Helper
 {
@@ -37,9 +37,13 @@ namespace CarCareTracker.Helper
             result = result.OrderBy(x => x.Date).ThenBy(x => x.Mileage).ThenBy(x=>x.EndingSoc).ToList();
             var computedResults = new List<GasRecordViewModel>();
             int previousMileage = 0;
-            int previousEndingSoc = 0;
             decimal unFactoredConsumption = 0.00M;
             int unFactoredMileage = 0;
+            //EV only: charge events since the last successful consumption calculation.
+            //Consumption is computed between the current charge and an earlier charge
+            //in this window that ended at a similar state of charge.
+            const int socMatchTolerancePercent = 4;
+            var pendingChargeWindow = new List<(int Mileage, int EndingSoc, decimal Gallons)>();
             //perform computation.
             for (int i = 0; i < result.Count; i++)
             {
@@ -48,23 +52,6 @@ namespace CarCareTracker.Helper
                 {
                     if (i > 0)
                     {
-                        decimal convertedConsumption;
-                        decimal convertedStartSoc = currentObject.StartingSoc / 100M;
-                        decimal convertedEndSoc = currentObject.EndingSoc / 100M;
-                        decimal convertedPreviousEndingSoc = previousEndingSoc / 100M;
-                        try
-                        {
-                            decimal currentBatteryCapacity = currentObject.Gallons / (convertedEndSoc - convertedStartSoc);
-                            convertedConsumption = convertedPreviousEndingSoc > 0.00M ? (convertedPreviousEndingSoc - convertedStartSoc) * currentBatteryCapacity : 0.00M;
-                            if (convertedConsumption < 0.00M) //negative consumption values can be caused by start soc greater than previous ending soc
-                            {
-                                convertedConsumption = 0.00M;
-                            }
-                        }
-                        catch
-                        {
-                            convertedConsumption = 0.00M;
-                        }
                         var deltaMileage = currentObject.Mileage - previousMileage;
                         if (deltaMileage < 0)
                         {
@@ -77,7 +64,7 @@ namespace CarCareTracker.Helper
                             MonthId = currentObject.Date.Month,
                             Date = currentObject.Date.ToShortDateString(),
                             Mileage = currentObject.Mileage,
-                            Gallons = convertedConsumption,
+                            Gallons = currentObject.Gallons,
                             Cost = currentObject.Cost,
                             DeltaMileage = deltaMileage,
                             CostPerGallon = currentObject.Gallons > 0.00M ? currentObject.Cost / currentObject.Gallons : 0,
@@ -92,25 +79,58 @@ namespace CarCareTracker.Helper
                         };
                         if (currentObject.MissedFuelUp)
                         {
-                            //if they missed a fuel up, we skip MPG calculation.
+                            //a charge in between wasn't logged, so the window can't be trusted - start fresh.
                             gasRecordViewModel.MilesPerGallon = 0;
+                            pendingChargeWindow.Clear();
+                            if (currentObject.Mileage != default)
+                            {
+                                pendingChargeWindow.Add((currentObject.Mileage, currentObject.EndingSoc, 0.00M));
+                            }
                         }
                         else if (currentObject.Mileage != default)
                         {
-                            if (convertedConsumption > 0.00M && deltaMileage > 0)
+                            //look back through the pending window for a charge that ended at a similar SoC.
+                            int matchIndex = -1;
+                            for (int w = pendingChargeWindow.Count - 1; w >= 0; w--)
                             {
-                                try
+                                if (Math.Abs(pendingChargeWindow[w].EndingSoc - currentObject.EndingSoc) <= socMatchTolerancePercent)
                                 {
-                                    gasRecordViewModel.MilesPerGallon = useMPG ? (unFactoredMileage + deltaMileage) / (unFactoredConsumption + convertedConsumption) : 100 / ((unFactoredMileage + deltaMileage) / (unFactoredConsumption + convertedConsumption));
+                                    matchIndex = w;
+                                    break;
                                 }
-                                catch
+                            }
+                            if (matchIndex >= 0)
+                            {
+                                var anchor = pendingChargeWindow[matchIndex];
+                                var totalMileage = currentObject.Mileage - anchor.Mileage;
+                                var totalGallons = currentObject.Gallons;
+                                for (int w = matchIndex + 1; w < pendingChargeWindow.Count; w++)
                                 {
-                                    gasRecordViewModel.MilesPerGallon = 0;
+                                    totalGallons += pendingChargeWindow[w].Gallons;
                                 }
+                                if (totalMileage > 0 && totalGallons > 0.00M)
+                                {
+                                    try
+                                    {
+                                        gasRecordViewModel.MilesPerGallon = useMPG ? totalMileage / totalGallons : 100 / (totalMileage / totalGallons);
+                                    }
+                                    catch
+                                    {
+                                        gasRecordViewModel.MilesPerGallon = 0;
+                                    }
+                                }
+                                //this charge is now the reliable reference point - discard everything before it.
+                                pendingChargeWindow.Clear();
+                                pendingChargeWindow.Add((currentObject.Mileage, currentObject.EndingSoc, 0.00M));
+                            }
+                            else
+                            {
+                                gasRecordViewModel.MilesPerGallon = 0;
+                                pendingChargeWindow.Add((currentObject.Mileage, currentObject.EndingSoc, currentObject.Gallons));
                             }
                         }
                         computedResults.Add(gasRecordViewModel);
-                    } 
+                    }
                     else
                     {
                         computedResults.Add(new GasRecordViewModel()
@@ -134,14 +154,14 @@ namespace CarCareTracker.Helper
                             ExtraFields = currentObject.ExtraFields,
                             Files = currentObject.Files
                         });
+                        if (currentObject.Mileage != default)
+                        {
+                            pendingChargeWindow.Add((currentObject.Mileage, currentObject.EndingSoc, 0.00M));
+                        }
                     }
                     if (currentObject.Mileage != default)
                     {
                         previousMileage = currentObject.Mileage;
-                    }
-                    if (currentObject.EndingSoc != default)
-                    {
-                        previousEndingSoc = currentObject.EndingSoc;
                     }
                 } 
                 else
